@@ -226,6 +226,148 @@ func getVal() []any {
 	}
 }
 
+func TestCanMemHash(t *testing.T) {
+	tests := []struct {
+		val  any
+		want bool
+	}{
+		{tailcfg.PortRange{}, true},
+		{netaddr.IP{}, true},
+		{netaddr.IPRange{}, true},
+		{netaddr.IPPort{}, false},   // gaps
+		{netaddr.IPPrefix{}, false}, // gaps
+		{int16(0), true},
+		{struct {
+			_ int
+			_ int
+		}{}, true},
+		{struct {
+			_ int
+			_ uint8
+			_ int
+		}{}, false}, // gap
+	}
+	for _, tt := range tests {
+		got := canMemHash(reflect.TypeOf(tt.val))
+		if got != tt.want {
+			t.Errorf("for type %T: got %v, want %v", tt.val, got, tt.want)
+		}
+	}
+}
+
+func TestGetTypeHasher(t *testing.T) {
+	switch runtime.GOARCH {
+	case "amd64", "arm64", "arm", "386", "riscv64":
+	default:
+		// Test outputs below are specifically for little-endian machines.
+		// Just skip everything else for now. Feel free to add more above if
+		// you have the hardware to test and it's little-endian.
+		t.Skipf("skipping on %v", runtime.GOARCH)
+	}
+	type typedString string
+	var (
+		someInt        = int('A')
+		someComplex128 = complex128(1 + 2i)
+	)
+	tests := []struct {
+		name string
+		val  any
+		want bool // set true automatically if out != ""
+		out  string
+	}{
+		{
+			name: "int",
+			val:  int(1),
+			out:  "\x02",
+		},
+		{
+			name: "int_negative",
+			val:  int(-1),
+			out:  "\x01",
+		}, {
+			name: "int8",
+			val:  int8(1),
+			out:  "\x02",
+		},
+		{
+			name: "string",
+			val:  "foo",
+			out:  "\x03\x00\x00\x00\x00\x00\x00\x00foo",
+		},
+		{
+			name: "typedString",
+			val:  typedString("foo"),
+			out:  "\x03\x00\x00\x00\x00\x00\x00\x00foo",
+		},
+		{
+			name: "string_slice",
+			val:  []string{"foo", "bar"},
+			out:  "\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x03\x00\x00\x00\x00\x00\x00\x00bar",
+		},
+		{
+			name: "int_slice",
+			val:  []int{0xcafebeef, 0xffeeddccbbaa},
+			out:  "\x02\x00\x00\x00\x00\x00\x00\x00\xef\xbe\xfe\xca\x00\x00\x00\x00\xaa\xbb\xcc\xdd\xee\xff\x00\x00",
+		},
+		{
+			name: "struct",
+			val: struct {
+				a, b int
+				c    uint16
+			}{1, -1, 2},
+			out: "\x02\x01\x02",
+		},
+		{
+			name: "nil_int_ptr",
+			val:  (*int)(nil),
+			out:  "\x00",
+		},
+		{
+			name: "int_ptr",
+			val:  &someInt,
+			out:  "\x01A\x00\x00\x00\x00\x00\x00\x00",
+		},
+		{
+			name: "nil_uint32_ptr",
+			val:  (*uint32)(nil),
+			out:  "\x00",
+		},
+		{
+			name: "complex128_ptr",
+			val:  &someComplex128,
+			out:  "\x01\x00\x00\x00\x00\x00\x00\xf0?\x00\x00\x00\x00\x00\x00\x00@",
+		},
+		{
+			name: "packet_filter",
+			val:  filterRules,
+			out:  "\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x00\x00\x00\x00\x01\x02\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x84\x86\x88\x88\xf0\xff?\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 \x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rv := reflect.ValueOf(tt.val)
+			fn := getTypeHasher(rv.Type())
+			var buf bytes.Buffer
+			h := &hasher{
+				bw: bufio.NewWriter(&buf),
+			}
+			got := fn(h, rv)
+			if tt.out != "" {
+				tt.want = true
+			}
+			if got != tt.want {
+				t.Fatalf("func returned %v; want %v", got, tt.want)
+			}
+			if err := h.bw.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if got := buf.String(); got != tt.out {
+				t.Fatalf("got %q; want %q", got, tt.out)
+			}
+		})
+	}
+}
+
 var sink = Hash("foo")
 
 func BenchmarkHash(b *testing.B) {
@@ -233,6 +375,34 @@ func BenchmarkHash(b *testing.B) {
 	v := getVal()
 	for i := 0; i < b.N; i++ {
 		sink = Hash(v)
+	}
+}
+
+func intPtr(n int) *int { return &n }
+
+// filterRules is a 1-element FilterRule with everything populated.
+var filterRules = []tailcfg.FilterRule{
+	{
+		SrcIPs:  []string{"*", "10.1.3.4/32", "10.0.0.0/24"},
+		SrcBits: []int{1, 2, 3},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "1.2.3.4/32",
+			Bits:  intPtr(32),
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+		IPProto: []int{1, 2, 3, 4},
+		CapGrant: []tailcfg.CapGrant{{
+			Dsts: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.2.3.4/32")},
+			Caps: []string{"foo"},
+		}},
+	},
+}
+
+func BenchmarkHashPacketFilter(b *testing.B) {
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		sink = Hash(filterRules)
 	}
 }
 

@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
+	"log"
 	"math"
 	"reflect"
 	"sync"
@@ -161,26 +162,218 @@ func (h *hasher) hashUint64(i uint64) {
 	binary.LittleEndian.PutUint64(h.scratch[:8], i)
 	h.bw.Write(h.scratch[:8])
 }
+func (h *hasher) hashVarint(x uint64) {
+	i := 0
+	for x >= 0x80 {
+		h.scratch[i] = byte(x) | 0x80
+		x >>= 7
+		i++
+	}
+	h.scratch[i] = byte(x)
+	h.bw.Write(h.scratch[:i+1])
+}
 
 var uint8Type = reflect.TypeOf(byte(0))
+
+// returns ok if it was handled; else slow path runs
+type typeHasherFunc func(h *hasher, v reflect.Value) (ok bool)
+
+// A non-nil typeHasherFuture is populated into the typeHasher map
+// when its type is first requested, before its func is created.
+// Its func field fn is only populated once the type has been created.
+// This is used for recursive types.
+type typeHasherFuture struct {
+	fn typeHasherFunc // nil until created
+}
+
+var typeHasher sync.Map // map[reflect.Type]*typeHasherFuture
+
+var genTypeHasherMu sync.Mutex // held while populating the map
+
+func getTypeHasher(t reflect.Type) typeHasherFunc {
+	if f, ok := typeHasher.Load(t); ok {
+		return f.(*typeHasherFuture).fn
+	}
+	genTypeHasherMu.Lock()
+	defer genTypeHasherMu.Unlock()
+
+	fu := getTypeHasherFutureLocked(t)
+	return fu.fn
+}
+
+func getTypeHasherFutureLocked(t reflect.Type) *typeHasherFuture {
+	if f, ok := typeHasher.Load(t); ok {
+		return f.(*typeHasherFuture)
+	}
+	fu := new(typeHasherFuture)
+	typeHasher.Store(t, fu)
+	fu.fn = genTypeHasherLocked(t)
+	return fu
+}
+
+const debug = false
+
+func genTypeHasherLocked(t reflect.Type) typeHasherFunc {
+	if debug {
+		log.Printf("generating func for %v", t)
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return func(h *hasher, v reflect.Value) bool {
+			i64 := v.Int()
+			ux := uint64(i64) << 1
+			if i64 < 0 {
+				ux = ^ux
+			}
+			h.hashVarint(ux)
+			return true
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return func(h *hasher, v reflect.Value) bool {
+			h.hashVarint(v.Uint())
+			return true
+		}
+	case reflect.String:
+		return (*hasher).hashString
+	case reflect.Slice:
+		et := t.Elem()
+		if canMemHash(et) {
+			return (*hasher).hashSliceMem
+		}
+		efu := getTypeHasherFutureLocked(et)
+		return func(h *hasher, v reflect.Value) bool {
+			vLen := v.Len()
+			h.hashUint64(uint64(vLen))
+			for i := 0; i < vLen; i++ {
+				if !efu.fn(h, v.Index(i)) {
+					return false
+				}
+			}
+			return true
+		}
+	case reflect.Struct:
+		type indexAndFuture struct {
+			index int
+			fu    *typeHasherFuture
+		}
+		fields := make([]indexAndFuture, 0, t.NumField())
+		for i, n := 0, t.NumField(); i < n; i++ {
+			sf := t.Field(i)
+			if sf.Type.Size() == 0 {
+				continue
+			}
+			fields = append(fields, indexAndFuture{i, getTypeHasherFutureLocked(sf.Type)})
+		}
+		return func(h *hasher, v reflect.Value) bool {
+			for _, f := range fields {
+				if !f.fu.fn(h, v.Field(f.index)) {
+					return false
+				}
+			}
+			return true
+		}
+	case reflect.Pointer:
+		et := t.Elem()
+		if canMemHash(et) || t.String() == "*intern.Value" {
+			// As a starting point, only handle pointers to hashable memory.
+			// This means we don't need to deal with cycle detection here yet.
+			return func(h *hasher, v reflect.Value) bool {
+				if v.IsNil() {
+					h.hashUint8(0) // indicates nil
+				} else {
+					h.hashUint8(1) // indicates visiting a pointer
+					h.bw.Write(unsafe.Slice((*byte)(v.UnsafePointer()), et.Size()))
+				}
+				return true
+			}
+		}
+	}
+
+	// Use AppendTo methods, if available and cheap.
+	if t.Implements(appenderToType) {
+		return func(h *hasher, v reflect.Value) bool {
+			if !v.CanInterface() || !v.CanAddr() {
+				return false // slow path
+			}
+			a := v.Addr().Interface().(appenderTo)
+			size := h.scratch[:8]
+			record := a.AppendTo(size)
+			binary.LittleEndian.PutUint64(record, uint64(len(record)-len(size)))
+			h.bw.Write(record)
+			return true
+		}
+	}
+	return func(h *hasher, v reflect.Value) bool {
+		if debug {
+			log.Printf("unhandled type %v", v.Type())
+		}
+		return false
+	}
+}
+
+// hashString hashes v, of kind String.
+func (h *hasher) hashString(v reflect.Value) bool {
+	s := v.String()
+	h.hashUint64(uint64(len(s)))
+	h.bw.WriteString(s)
+	return true
+}
+
+// hashSliceMem hashes v, of kind Slice, with a memhash-able element type.
+func (h *hasher) hashSliceMem(v reflect.Value) bool {
+	vLen := v.Len()
+	h.hashUint64(uint64(vLen))
+	if vLen == 0 {
+		return true
+	}
+	h.bw.Write(unsafe.Slice((*byte)(v.UnsafePointer()), v.Type().Elem().Size()*uintptr(vLen)))
+	return true
+}
+
+// canMemHash reports whether a slice of t can be hashed by looking at its
+// contiguous bytes in memory alone. (e.g. structs with gaps aren't memhashable)
+func canMemHash(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uintptr, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float64, reflect.Float32, reflect.Complex128, reflect.Complex64:
+		return true
+	case reflect.Array:
+		return canMemHash(t.Elem())
+	case reflect.Struct:
+		var sumFieldSize uintptr
+		for i, numField := 0, t.NumField(); i < numField; i++ {
+			sf := t.Field(i)
+			if !canMemHash(sf.Type) {
+				// Special case for 0-width fields that aren't at the end.
+				if sf.Type.Size() == 0 && i < numField-1 {
+					continue
+				}
+				return false
+			}
+			sumFieldSize += sf.Type.Size()
+		}
+		return sumFieldSize == t.Size() // else there are gaps
+	case reflect.Pointer:
+		if t.String() == "*intern.Value" {
+			// Special case for inet.af/netaddr & net/netip.
+			return true
+		}
+	}
+	return false // TODO: more
+}
 
 func (h *hasher) hashValue(v reflect.Value) {
 	if !v.IsValid() {
 		return
 	}
-
+	fn := getTypeHasher(v.Type())
+	if fn(h, v) {
+		return
+	}
 	w := h.bw
-
-	if v.CanInterface() {
-		// Use AppendTo methods, if available and cheap.
-		if v.CanAddr() && v.Type().Implements(appenderToType) {
-			a := v.Addr().Interface().(appenderTo)
-			size := h.scratch[:8]
-			record := a.AppendTo(size)
-			binary.LittleEndian.PutUint64(record, uint64(len(record)-len(size)))
-			w.Write(record)
-			return
-		}
+	if debug {
+		log.Printf("doing slow path for %v", v.Type())
 	}
 
 	// TODO(dsnet): Avoid cycle detection for types that cannot have cycles.
@@ -258,10 +451,6 @@ func (h *hasher) hashValue(v reflect.Value) {
 
 		h.hashUint8(1) // indicates visiting a map
 		h.hashMap(v)
-	case reflect.String:
-		s := v.String()
-		h.hashUint64(uint64(len(s)))
-		w.WriteString(s)
 	case reflect.Bool:
 		if v.Bool() {
 			h.hashUint8(1)
